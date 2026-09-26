@@ -50,6 +50,7 @@ def main() -> int:
     im = Image.open(args.input)
     im = im.convert("L")          # grain must be neutral
     if args.invert:
+        print("inverted")
         im = Image.eval(im, lambda v: 255 - v)
     if args.preblur > 0:
         im = im.filter(ImageFilter.GaussianBlur(args.preblur))
