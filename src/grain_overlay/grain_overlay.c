@@ -4,6 +4,11 @@
  * Target: Canon 550D (DIGIC 4). Should work on other DIGIC 4/5 bodies with
  * CONFIG_RAW_PHOTO, but only the 550D was designed for.
  *
+ * DIGIC 6+ (750D, 80D, 200D, ...): NOT supported. ML has no photo raw access
+ * there (no CONFIG_RAW_PHOTO, no edmac_memcpy), so the module loads but stays
+ * inert and says so in the menu. Optional core symbols are imported WEAK: a hard
+ * import of a symbol the camera lacks makes ML's linker fail for ALL modules.
+ *
  * USAGE
  *   1. Copy the plate to the card as  ML/GRAIN.GRN
  *   2. Canon menu: picture quality RAW or RAW+JPEG, image review ON (2s or more)
@@ -58,6 +63,17 @@
 
 #define PLATE_PATH      "ML/GRAIN.GRN"
 #define STRIP_ROWS      32
+
+/* not exported on every camera (e.g. DIGIC 6 has no edmac_memcpy); ret_0 when missing */
+extern WEAK_FUNC(ret_0) void* edmac_memcpy(void* dest, void* srce, size_t n);
+extern WEAK_FUNC(ret_0) int get_digic_version(void);
+
+/* photo raw access only exists for DIGIC 4/5 in ML; 0 = old core without get_digic_version */
+static int camera_supported(void)
+{
+    int digic = get_digic_version();
+    return digic == 0 || digic <= 5;
+}
 
 static CONFIG_INT("grain.enabled",  grain_enabled,  0);
 static CONFIG_INT("grain.strength", grain_strength, 50);
@@ -369,6 +385,7 @@ done:
 PROP_HANDLER(PROP_GUI_STATE)
 {
     if (!grain_enabled) return;
+    if (!camera_supported()) return;
 
     uint32_t * data = buf;
     if (data[0] != GUISTATE_QR) return;
@@ -394,7 +411,9 @@ static MENU_UPDATE_FUNC(grain_main_update)
 {
     if (!grain_enabled) return;
 
-    if (!can_use_raw_overlays_photo())
+    if (!camera_supported())
+        MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "DIGIC %d: ML has no photo raw access on this camera.", get_digic_version());
+    else if (!can_use_raw_overlays_photo())
         MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Set picture quality to RAW or RAW+JPEG.");
     else if (image_review_time == 0)
         MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Enable image review from Canon menu.");
