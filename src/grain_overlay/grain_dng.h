@@ -221,6 +221,31 @@ static inline int grn_dng_build_header(uint8_t * buf, int buf_size, const struct
     return header_size;
 }
 
+/* pack one row straight into DNG order (14-bit big-endian bit stream), the same
+ * bytes as grn_pack_row + grn_row_to_dng in one pass; width multiple of 8 */
+static inline void grn_pack_row_dng(const uint16_t * in, uint8_t * o, int width)
+{
+    for (int x = 0; x < width; x += 8, in += 8, o += 14)
+    {
+        uint32_t a = in[0], b = in[1], c = in[2], d = in[3];
+        uint32_t e = in[4], f = in[5], g = in[6], h = in[7];
+        o[0]  = a >> 6;
+        o[1]  = a << 2 | b >> 12;
+        o[2]  = b >> 4;
+        o[3]  = b << 4 | c >> 10;
+        o[4]  = c >> 2;
+        o[5]  = c << 6 | d >> 8;
+        o[6]  = d;
+        o[7]  = e >> 6;
+        o[8]  = e << 2 | f >> 12;
+        o[9]  = f >> 4;
+        o[10] = f << 4 | g >> 10;
+        o[11] = g >> 2;
+        o[12] = g << 6 | h >> 8;
+        o[13] = h;
+    }
+}
+
 /* Canon packs 14-bit data as little-endian 16-bit words; DNG wants a big-endian bit stream */
 static inline void grn_row_to_dng(uint8_t * row, int bytes)
 {

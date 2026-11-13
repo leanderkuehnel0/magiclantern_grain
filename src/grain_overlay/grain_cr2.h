@@ -26,6 +26,7 @@
 
 #define GRN_CR2_MAX_SLICES  4
 #define GRN_HUFF_LUT_BITS   9
+#define GRN_FAST_BITS       11      /* code + difference bits in one lookup (4 KB per table) */
 
 #define GRN_CR2_ERR_READ      -10
 #define GRN_CR2_ERR_FORMAT    -11   /* not a CR2 / missing tags */
@@ -40,6 +41,7 @@ typedef int (*grn_read_fn)(void * ctx, uint32_t off, void * buf, int n);
 
 struct grn_huff
 {
+    int16_t  fast[1 << GRN_FAST_BITS];      /* (diff << 4) | total bits, when code + diff bits fit; 0 = use lut */
     uint16_t lut[1 << GRN_HUFF_LUT_BITS];   /* (len << 8) | value; 0 = code longer than LUT */
     int32_t  maxcode[17];                   /* largest code of each length, -1 = none */
     int32_t  valoff[17];                    /* index into vals = code + valoff[len] */
@@ -246,6 +248,22 @@ static inline int grn_huff_build(struct grn_huff * h, const uint8_t * counts, co
                 int shift = GRN_HUFF_LUT_BITS - len;
                 for (int j = 0; j < (1 << shift); j++)
                     h->lut[(code << shift) | j] = (len << 8) | vals[k];
+            }
+
+            /* fast table: every value of the difference bits that follow the code */
+            int ssss = vals[k];
+            if (ssss < 16 && len + ssss <= GRN_FAST_BITS)
+            {
+                int shift = GRN_FAST_BITS - len - ssss;
+                for (int x = 0; x < (1 << ssss); x++)
+                {
+                    int diff = x;
+                    if (ssss && !(x & (1 << (ssss - 1)))) diff -= (1 << ssss) - 1;
+                    int16_t e = (int16_t) ((diff * 16) | (len + ssss));
+                    int base = (((code << ssss) | x) << shift);
+                    for (int j = 0; j < (1 << shift); j++)
+                        h->fast[base | j] = e;
+                }
             }
         }
         if (code > (1 << len)) return GRN_CR2_ERR_JPEG;
@@ -558,9 +576,21 @@ static inline int grn_lj_run(struct grn_ljdec * d, uint16_t * out, int n, const 
 
     for (int i = 0; i < n; i++)
     {
-        /* Huffman: length of the difference (SSSS) */
         GRN_FILL();
         const struct grn_huff * hh = h[comp];
+        int diff;
+
+        /* common case: code and difference bits in one lookup */
+        int f = hh->fast[bitbuf >> (32 - GRN_FAST_BITS)];
+        if (f)
+        {
+            int nb = f & 15;
+            bitbuf <<= nb; bitcnt -= nb;
+            diff = f >> 4;
+            goto have_diff;
+        }
+
+        /* Huffman: length of the difference (SSSS) */
         int e = hh->lut[bitbuf >> (32 - GRN_HUFF_LUT_BITS)];
         int l, len;
         if (e)
@@ -595,7 +625,7 @@ static inline int grn_lj_run(struct grn_ljdec * d, uint16_t * out, int n, const 
         }
 
         /* difference bits */
-        int diff = 0;
+        diff = 0;
         if (len >= 16)
         {
             if (len > 16) { err = GRN_CR2_ERR_DATA; break; }
@@ -607,6 +637,17 @@ static inline int grn_lj_run(struct grn_ljdec * d, uint16_t * out, int n, const 
             diff = bitbuf >> (32 - len);
             bitbuf <<= len; bitcnt -= len;
             if (!(diff & (1 << (len - 1)))) diff -= (1 << len) - 1;
+        }
+
+    have_diff:
+        if (!full && col)
+        {
+            if (++comp == clrs)
+            {
+                comp = 0;
+                if (++col == jw) col = 0;
+            }
+            continue;
         }
 
         /* predictor 1 (left); first column: same component of the previous row start */
@@ -648,7 +689,8 @@ struct grn_cr2_job
     uint8_t * in[GRN_CR2_MAX_SLICES];     /* cached input chunks, one per slice */
     int in_size;
     uint16_t * row;                       /* width */
-    uint16_t * plate_row;                 /* plate_w, cached */
+    uint16_t * plate_row;                 /* optional cached plate_w buffer (plate_strip in DMA memory);
+                                           * NULL: blend straight from plate_strip (cached strip only) */
     uint8_t * packed_row;                 /* optional cached pitch buffer, then memcpy to out (DMA);
                                            * NULL: pack straight into out (cached out only) */
     uint8_t * out;                        /* strip_rows * pitch */
@@ -862,14 +904,18 @@ static inline int grn_cr2_to_dng(struct grn_cr2_job * j, uint8_t * hdr, int hdr_
                     return GRN_CR2_ERR_PLATE;
                 plate_rows = m;
             }
-            memcpy(j->plate_row, j->plate_strip + (py - plate_start) * plate_row_bytes, plate_row_bytes);
-            grn_blend_span(&j->bp, j->row, c->x1, j->plate_row, j->plate_w);
+            const uint16_t * pr = (const uint16_t *) (j->plate_strip + (py - plate_start) * plate_row_bytes);
+            if (j->plate_row)
+            {
+                memcpy(j->plate_row, pr, plate_row_bytes);
+                pr = j->plate_row;
+            }
+            grn_blend_span(&j->bp, j->row, c->x1, pr, j->plate_w);
         }
 
         uint8_t * dst = j->out + n_out * pitch;
         uint8_t * pk = j->packed_row ? j->packed_row : dst;
-        grn_pack_row(j->row, pk, W);
-        grn_row_to_dng(pk, pitch);
+        grn_pack_row_dng(j->row, pk, W);
         if (pk != dst) memcpy(dst, pk, pitch);
 
         if (++n_out == j->strip_rows || y == H - 1)

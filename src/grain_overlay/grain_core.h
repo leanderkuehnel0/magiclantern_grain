@@ -127,7 +127,8 @@ static inline int grn_plate_q14(const struct grn_blend_params * bp, int v)
  *   Overlay: ov  = overlay(a, b); out = d + s*(ov - d)
  *            (plate should be centered at 50% gray; 50% gray = no change)
  */
-static inline int grn_blend_pixel(const struct grn_blend_params * bp, int p, int plate_v)
+static inline __attribute__((always_inline))
+int grn_blend_pixel_mode(const struct grn_blend_params * bp, const int mode, int p, int plate_v)
 {
     const int R = bp->range;
     const int s = bp->strength_q14;
@@ -135,7 +136,7 @@ static inline int grn_blend_pixel(const struct grn_blend_params * bp, int p, int
     int b = grn_plate_q14(bp, plate_v);
     int out;
 
-    switch (bp->mode)
+    switch (mode)
     {
         case GRN_BLEND_SCREEN:
         {
@@ -169,13 +170,29 @@ static inline int grn_blend_pixel(const struct grn_blend_params * bp, int p, int
     return out;
 }
 
+static inline int grn_blend_pixel(const struct grn_blend_params * bp, int p, int plate_v)
+{
+    return grn_blend_pixel_mode(bp, bp->mode, p, plate_v);
+}
+
 /* blend a span of one row: row[x0 .. x0+n-1] with plate[0 .. n-1] */
 static inline void grn_blend_span(const struct grn_blend_params * bp, uint16_t * row, int x0,
                                   const uint16_t * plate, int n)
 {
     uint16_t * r = row + x0;
-    for (int i = 0; i < n; i++)
-        r[i] = grn_blend_pixel(bp, r[i], plate[i]);
+    /* one loop per mode, so the mode switch is not evaluated per pixel */
+    switch (bp->mode)
+    {
+        case GRN_BLEND_SCREEN:
+            for (int i = 0; i < n; i++) r[i] = grn_blend_pixel_mode(bp, GRN_BLEND_SCREEN, r[i], plate[i]);
+            break;
+        case GRN_BLEND_LIGHTEN:
+            for (int i = 0; i < n; i++) r[i] = grn_blend_pixel_mode(bp, GRN_BLEND_LIGHTEN, r[i], plate[i]);
+            break;
+        default:
+            for (int i = 0; i < n; i++) r[i] = grn_blend_pixel_mode(bp, GRN_BLEND_OVERLAY, r[i], plate[i]);
+            break;
+    }
 }
 
 /* parse & validate the 24-byte header; returns 0 on success */

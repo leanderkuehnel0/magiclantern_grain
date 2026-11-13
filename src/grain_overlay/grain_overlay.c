@@ -428,6 +428,104 @@ done:
 /* CR2 source (DIGIC 6/7)                                              */
 /* ------------------------------------------------------------------ */
 
+/*
+ * D-cache maintenance by address, so FIO can DMA straight into and out of
+ * cacheable buffers. Copying through uncacheable memory instead ran at ~7 MB/s
+ * on the 750D (first log: 6 s of CR2 "reads" for 38 MB, plate 48 MB in 1 s).
+ * ML core does not export a usable routine on DIGIC 6 (sync_caches only cleans).
+ * Same CP15 encodings on ARM946 (DIGIC 4/5) and Cortex-R4 (DIGIC 6), 32-byte
+ * lines; cache_selftest() checks them before every conversion.
+ */
+#define DCACHE_LINE 32
+
+static void dcache_clean(const void * p, int n)
+{
+    for (uint32_t a = (uint32_t) p & ~(DCACHE_LINE - 1); a < (uint32_t) p + n; a += DCACHE_LINE)
+        asm volatile ("mcr p15, 0, %0, c7, c10, 1" : : "r"(a) : "memory");
+    asm volatile ("mcr p15, 0, %0, c7, c10, 4" : : "r"(0) : "memory");     /* drain write buffer */
+}
+
+static void dcache_clean_inval(const void * p, int n)
+{
+    for (uint32_t a = (uint32_t) p & ~(DCACHE_LINE - 1); a < (uint32_t) p + n; a += DCACHE_LINE)
+        asm volatile ("mcr p15, 0, %0, c7, c14, 1" : : "r"(a) : "memory");
+    asm volatile ("mcr p15, 0, %0, c7, c10, 4" : : "r"(0) : "memory");
+}
+
+static void dcache_inval(const void * p, int n)
+{
+    for (uint32_t a = (uint32_t) p & ~(DCACHE_LINE - 1); a < (uint32_t) p + n; a += DCACHE_LINE)
+        asm volatile ("mcr p15, 0, %0, c7, c6, 1" : : "r"(a) : "memory");
+    asm volatile ("mcr p15, 0, %0, c7, c10, 4" : : "r"(0) : "memory");
+}
+
+static void * align_line(void * p)
+{
+    return (void *) (((uint32_t) p + DCACHE_LINE - 1) & ~(DCACHE_LINE - 1));
+}
+
+/* clean must reach RAM (seen through the uncacheable alias) and invalidate
+ * must expose what was written behind the cache's back (like DMA) */
+static int cache_selftest(void)
+{
+    void * raw = tmp_malloc(4096 + 2 * DCACHE_LINE);
+    if (!raw) return 0;
+    volatile uint32_t * c = align_line(raw);
+    volatile uint32_t * u = UNCACHEABLE(c);
+    int ok = (void *) u != (void *) c;
+    uint32_t sum = 0;
+
+    for (int i = 0; i < 1024; i++) c[i] = 0xA5000000 | i;
+    dcache_clean((void *) c, 4096);
+    for (int i = 0; i < 1024; i++) if (u[i] != (0xA5000000u | i)) ok = 0;
+
+    for (int i = 0; i < 1024; i++) sum += c[i];         /* lines valid in the cache again */
+    for (int i = 0; i < 1024; i++) u[i] = 0x5A000000 | i;
+    dcache_inval((void *) c, 4096);
+    for (int i = 0; i < 1024; i++) if (c[i] != (0x5A000000u | i)) ok = 0;
+
+    free(raw);
+    return ok && sum;
+}
+
+/* what this task gets right now (LiveView, overlays...); debug log only */
+static void cr2_bench(void)
+{
+    void * raw = tmp_malloc(2 * 16384 + 2 * DCACHE_LINE);
+    if (!raw) return;
+    uint32_t * a = align_line(raw);
+    uint32_t * b = a + 4096;
+    volatile uint32_t * ua = UNCACHEABLE(a);
+    volatile uint32_t sink = 0;
+    memset(a, 1, 16384);
+    dcache_clean(a, 16384);
+
+    int t0 = get_ms_clock();
+    uint32_t x = 1, y = 0;
+    for (int i = 0; i < 2000000; i++) { x = x * 1103515245 + 12345; y ^= x >> 7; }
+    sink = y;
+    int t_alu = get_ms_clock() - t0;
+
+    t0 = get_ms_clock();
+    for (int k = 0; k < 64; k++)
+        for (int i = 0; i < 4096; i++) sink += a[i];
+    int t_cached = get_ms_clock() - t0;             /* 1 MB */
+
+    t0 = get_ms_clock();
+    for (int k = 0; k < 16; k++)
+        for (int i = 0; i < 4096; i++) sink += ua[i];
+    int t_uncached = get_ms_clock() - t0;           /* 256 KB */
+
+    t0 = get_ms_clock();
+    for (int k = 0; k < 16; k++) memcpy(b, (void *) ua, 16384);
+    int t_memcpy = get_ms_clock() - t0;             /* 256 KB */
+
+    LOG("bench (lv %d): 2M alu loops %d ms, cached read %d KB/ms, uncached read %d KB/ms, uncached memcpy %d KB/ms",
+        lv, t_alu, 1024 / MAX(t_cached, 1), 256 / MAX(t_uncached, 1), 256 / MAX(t_memcpy, 1));
+    (void) sink;
+    free(raw);
+}
+
 struct cr2_io;
 
 /* one CR2 handle per slice decoder: every handle reads sequentially, no seeks */
@@ -438,25 +536,47 @@ struct cr2_src
     uint32_t pos;
 };
 
+#define CR2_MAX_BUFS 12
+
 struct cr2_io
 {
     struct cr2_src src[GRN_CR2_MAX_SLICES];
     FILE * plate, * out;
-    uint8_t * bounce;           /* DMA; FIO reads land here, then memcpy to the decoder chunk */
+    int cached;                 /* 1: FIO DMA straight into/out of cacheable buffers */
+    uint8_t * bounce;           /* DMA: small reads (all reads when !cached), then memcpy */
     int bounce_size;
+    void * raw[CR2_MAX_BUFS];   /* allocations, freed at the end */
+    int nraw;
     /* where the time goes (ms) and FIO call counts, for the debug log */
     int t_read, n_read, n_seek, t_plate, n_plate, t_write, n_write, t_yield;
 };
+
+/* DMA (uncacheable) or line-aligned cacheable buffer, so cache ops never touch neighbours */
+static void * cr2_alloc(struct cr2_io * io, int size, int dma)
+{
+    if (io->nraw >= CR2_MAX_BUFS) return 0;
+    void * p = dma ? fio_malloc(size) : tmp_malloc(size + 2 * DCACHE_LINE);
+    if (!p) return 0;
+    io->raw[io->nraw++] = p;
+    return dma ? p : align_line(p);
+}
+
+static void cr2_free_from(struct cr2_io * io, int mark)
+{
+    while (io->nraw > mark) free(io->raw[--io->nraw]);
+}
 
 static int cr2_read(void * ctx, uint32_t off, void * buf, int n)
 {
     struct cr2_src * s = ctx;
     struct cr2_io * io = s->io;
     int t0 = get_ms_clock();
+    /* > 2 KB: one of our aligned chunk buffers (header parsing uses a small malloc) */
+    const int direct = io->cached && n > 2048 && !((uint32_t) buf & (DCACHE_LINE - 1));
     int done = 0;
     while (done < n)
     {
-        int m = MIN(n - done, io->bounce_size);
+        int m = direct ? n : MIN(n - done, io->bounce_size);
         if (s->pos != off + done)
         {
             /* returns the new position (550D, 750D: "plate seek -> 24");
@@ -466,14 +586,25 @@ static int cr2_read(void * ctx, uint32_t off, void * buf, int n)
             s->pos = off + done;
             io->n_seek++;
         }
-        int r = FIO_ReadFile(s->f, io->bounce, m);
+        uint8_t * dst = (uint8_t *) buf + done;
+        int r;
+        if (direct)
+        {
+            dcache_clean_inval(dst, m);
+            r = FIO_ReadFile(s->f, UNCACHEABLE(dst), m);
+            dcache_inval(dst, m);
+        }
+        else
+        {
+            r = FIO_ReadFile(s->f, io->bounce, m);
+            if (r == m) memcpy(dst, io->bounce, m);
+        }
         io->n_read++;
         if (r != m)
         {
             s->pos = 0xFFFFFFFF;
             break;
         }
-        memcpy((uint8_t *) buf + done, io->bounce, m);
         s->pos += m;
         done += m;
     }
@@ -485,7 +616,17 @@ static int cr2_read_plate(void * ctx, void * buf, int n)
 {
     struct cr2_io * io = ctx;
     int t0 = get_ms_clock();
-    int r = FIO_ReadFile(io->plate, buf, n);
+    int r;
+    if (io->cached)
+    {
+        dcache_clean_inval(buf, n);
+        r = FIO_ReadFile(io->plate, UNCACHEABLE(buf), n);
+        dcache_inval(buf, n);
+    }
+    else
+    {
+        r = FIO_ReadFile(io->plate, buf, n);
+    }
     io->t_plate += get_ms_clock() - t0;
     io->n_plate++;
     return r;
@@ -493,10 +634,18 @@ static int cr2_read_plate(void * ctx, void * buf, int n)
 
 static int cr2_write(void * ctx, const void * buf, int n)
 {
-    /* buf is cacheable: ML's FIO_WriteFile cleans the cache before the DMA */
     struct cr2_io * io = ctx;
     int t0 = get_ms_clock();
-    int r = FIO_WriteFile(io->out, buf, n);
+    int r;
+    if (io->cached)
+    {
+        dcache_clean(buf, n);
+        r = FIO_WriteFile(io->out, UNCACHEABLE(buf), n);
+    }
+    else
+    {
+        r = FIO_WriteFile(io->out, buf, n);
+    }
     io->t_write += get_ms_clock() - t0;
     io->n_write++;
     return r;
@@ -575,40 +724,42 @@ static int cr2_wait_file(int file_number, char * fn, int size, uint32_t * fsize,
 
 /* buffer sizes, largest first: fewer FIO calls; fall back when memory is short */
 static const struct { int chunk, out_rows, plate_rows; } cr2_tiers[] = {
-    { 128 * 1024, 32, 32 },     /* ~1.1 MB on 750D */
-    {  64 * 1024, 16, 16 },     /* ~0.6 MB */
+    { 128 * 1024, 32, 32 },     /* ~1 MB on 750D */
+    {  64 * 1024, 16, 16 },     /* ~0.5 MB */
 };
 
-static void cr2_free_bufs(struct grn_cr2_job * j)
-{
-    for (int k = 0; k < GRN_CR2_MAX_SLICES; k++)
-        if (j->in[k]) { free(j->in[k]); j->in[k] = 0; }
-    if (j->row)         { free(j->row);         j->row = 0; }
-    if (j->packed_row)  { free(j->packed_row);  j->packed_row = 0; }
-    if (j->out)         { free(j->out);         j->out = 0; }
-    if (j->plate_row)   { free(j->plate_row);   j->plate_row = 0; }
-    if (j->plate_strip) { free(j->plate_strip); j->plate_strip = 0; }
-}
-
 /* temporary memory (shoot_malloc when available, like the 550D frame buffer) */
-static int cr2_alloc_bufs(struct grn_cr2_job * j, int tier)
+static int cr2_alloc_bufs(struct cr2_io * io, struct grn_cr2_job * j, int tier)
 {
     const struct grn_cr2 * c = j->c;
     const int pitch = c->width * 14 / 8;
+    const int dma = !io->cached;     /* where FIO DMA lands when the cache ops can't be used */
+
+    memset(j->in, 0, sizeof(j->in));
+    j->packed_row = 0;
+    j->plate_row = 0;
+    j->plate_strip = 0;
+
     for (int k = 0; k < c->nslices; k++)
-        if (!(j->in[k] = tmp_malloc(cr2_tiers[tier].chunk))) return 0;
+        if (!(j->in[k] = cr2_alloc(io, cr2_tiers[tier].chunk, 0))) return 0;
     j->in_size    = cr2_tiers[tier].chunk;
-    j->row        = malloc(c->width * 2);
-    j->packed_row = malloc(pitch);
-    j->out        = fio_malloc(pitch * cr2_tiers[tier].out_rows);
+    j->row        = cr2_alloc(io, c->width * 2, 0);
+    j->out        = cr2_alloc(io, pitch * cr2_tiers[tier].out_rows, dma);
     j->strip_rows = cr2_tiers[tier].out_rows;
-    if (!j->row || !j->packed_row || !j->out) return 0;
+    if (!j->row || !j->out) return 0;
+    if (dma && !(j->packed_row = cr2_alloc(io, pitch, 0))) return 0;
     if (j->strength > 0)
     {
-        j->plate_row   = malloc(j->plate_w * 2);
-        j->plate_strip = fio_malloc(j->plate_w * 2 * cr2_tiers[tier].plate_rows);
+        j->plate_strip = cr2_alloc(io, j->plate_w * 2 * cr2_tiers[tier].plate_rows, dma);
         j->plate_rows  = cr2_tiers[tier].plate_rows;
-        if (!j->plate_row || !j->plate_strip) return 0;
+        if (!j->plate_strip) return 0;
+        if (dma && !(j->plate_row = cr2_alloc(io, j->plate_w * 2, 0))) return 0;
+    }
+    if (!io->cached)
+    {
+        io->bounce = cr2_alloc(io, cr2_tiers[tier].chunk, 1);
+        io->bounce_size = cr2_tiers[tier].chunk;
+        if (!io->bounce) return 0;
     }
     return 1;
 }
@@ -618,7 +769,6 @@ static void cr2_process(int file_number, int max_wait)
     struct cr2_io io;
     memset(&io, 0, sizeof(io));
     struct grn_cr2_job * j = 0;
-    uint8_t * scratch = 0;
     uint8_t * hdr = 0;
     char cr2_fn[64], dng_fn[64], msg[48];
     int ok = 0;
@@ -636,14 +786,17 @@ static void cr2_process(int file_number, int max_wait)
     }
     LOG("%s: %d bytes", cr2_fn, fsize);
 
+    if (grain_debug) cr2_bench();
+
     int t0 = get_ms_clock();
-    for (int t = 0; t < COUNT(cr2_tiers) && !io.bounce; t++)
-    {
-        io.bounce = fio_malloc(cr2_tiers[t].chunk);
-        io.bounce_size = cr2_tiers[t].chunk;
-    }
-    scratch = malloc(2048);
-    j       = malloc(sizeof(*j));
+    io.cached = cache_selftest();
+    LOG("cache ops %s", io.cached ? "OK: direct DMA into cached buffers" : "FAILED: copying through DMA buffers");
+
+    /* small DMA buffer for header parsing (the big one comes with the job buffers) */
+    io.bounce = cr2_alloc(&io, 8192, 1);
+    io.bounce_size = 8192;
+    uint8_t * scratch = cr2_alloc(&io, 2048, 0);
+    j = malloc(sizeof(*j));
     for (int k = 0; k < GRN_CR2_MAX_SLICES; k++)
         io.src[k].io = &io;
     io.src[0].f = FIO_OpenFile(cr2_fn, O_RDONLY | O_SYNC);
@@ -711,14 +864,15 @@ static void cr2_process(int file_number, int max_wait)
     }
 
     int tier = -1;
+    const int mark = io.nraw;
     for (int t = 0; t < COUNT(cr2_tiers) && tier < 0; t++)
     {
-        if (cr2_tiers[t].chunk > io.bounce_size) continue;
-        if (cr2_alloc_bufs(j, t)) tier = t;
-        else cr2_free_bufs(j);
+        if (cr2_alloc_bufs(&io, j, t)) tier = t;
+        else cr2_free_from(&io, mark);
     }
-    hdr = fio_malloc(GRN_DNG_HEADER_MAX);
-    if (tier < 0 || !hdr) goto nomem;
+    if (tier < 0) goto nomem;
+    hdr = cr2_alloc(&io, GRN_DNG_HEADER_MAX, !io.cached);
+    if (!hdr) goto nomem;
     LOG("buffers: chunk %d KB, %d DNG rows, %d plate rows per call", j->in_size / 1024, j->strip_rows, j->plate_rows);
 
     j->ctx = &io;
@@ -754,7 +908,7 @@ static void cr2_process(int file_number, int max_wait)
 
     int total = get_ms_clock() - t0;
     int io_ms = io.t_read + io.t_plate + io.t_write;
-    LOG("total %d ms: pass1 %d, pass2 %d", total, j->t_index, j->t_total - j->t_index);
+    LOG("total %d ms (lv %d): pass1 %d, pass2 %d", total, lv, j->t_index, j->t_total - j->t_index);
     LOG("cr2 read %d ms (%d calls, %d seeks), plate read %d ms (%d), dng write %d ms (%d), yield %d ms",
         io.t_read, io.n_read, io.n_seek, io.t_plate, io.n_plate, io.t_write, io.n_write, io.t_yield);
     LOG("cpu (decode+blend+pack) %d ms", j->t_total - io_ms - io.t_yield);
@@ -773,14 +927,8 @@ done:
     if (io.plate) FIO_CloseFile(io.plate);
     for (int k = 0; k < GRN_CR2_MAX_SLICES; k++)
         if (io.src[k].f) FIO_CloseFile(io.src[k].f);
-    if (j)
-    {
-        cr2_free_bufs(j);
-        free(j);
-    }
-    if (hdr)       free(hdr);
-    if (scratch)   free(scratch);
-    if (io.bounce) free(io.bounce);
+    if (j) free(j);
+    cr2_free_from(&io, 0);
 
     log_flush();
 

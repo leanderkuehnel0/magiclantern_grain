@@ -121,7 +121,7 @@ static int run(struct grn_cr2 * c, const char * cr2_fn, const char * out_fn,
     for (int k = 0; k < c->nslices; k++) j.in[k] = malloc(in_size);
     j.in_size = in_size;
     j.row = malloc(c->width * 2);
-    j.plate_row = malloc(pw * 2 + 2);
+    j.plate_row = 0;                    /* cached camera path: blend straight from the plate strip */
     j.out = malloc(strip * c->width * 14 / 8);
     j.plate_strip = malloc(2 * strip * pw * 2 + 2);
     j.strip_rows = strip;
