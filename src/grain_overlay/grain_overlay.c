@@ -73,13 +73,6 @@
 #define LOG_PATH        "ML/LOGS/GRAIN.LOG"
 #define STRIP_ROWS      32
 
-/* CR2 source buffers */
-#define CR2_STRIP_ROWS  16
-#define CR2_CHUNK       (64 * 1024)
-
-/* small DMA-capable buffers for FIO; not fio_malloc, which prefers shoot memory */
-#define dma_malloc(len) __mem_malloc(len, MEM_DMA, __FILE__, __LINE__)
-
 /* not exported on every camera (e.g. DIGIC 6 has no edmac_memcpy); ret_0 when missing */
 extern WEAK_FUNC(ret_0) void* edmac_memcpy(void* dest, void* srce, size_t n);
 extern WEAK_FUNC(ret_0) int get_digic_version(void);
@@ -435,63 +428,96 @@ done:
 /* CR2 source (DIGIC 6/7)                                              */
 /* ------------------------------------------------------------------ */
 
+struct cr2_io;
+
+/* one CR2 handle per slice decoder: every handle reads sequentially, no seeks */
+struct cr2_src
+{
+    struct cr2_io * io;
+    FILE * f;
+    uint32_t pos;
+};
+
 struct cr2_io
 {
-    FILE * cr2, * plate, * out;
+    struct cr2_src src[GRN_CR2_MAX_SLICES];
+    FILE * plate, * out;
     uint8_t * bounce;           /* DMA; FIO reads land here, then memcpy to the decoder chunk */
-    uint32_t cr2_pos;           /* skip the seek for sequential reads */
+    int bounce_size;
+    /* where the time goes (ms) and FIO call counts, for the debug log */
+    int t_read, n_read, n_seek, t_plate, n_plate, t_write, n_write, t_yield;
 };
 
 static int cr2_read(void * ctx, uint32_t off, void * buf, int n)
 {
-    struct cr2_io * io = ctx;
+    struct cr2_src * s = ctx;
+    struct cr2_io * io = s->io;
+    int t0 = get_ms_clock();
     int done = 0;
     while (done < n)
     {
-        int m = MIN(n - done, CR2_CHUNK);
-        if (io->cr2_pos != off + done)
+        int m = MIN(n - done, io->bounce_size);
+        if (s->pos != off + done)
         {
-            /* returns the new position (550D); only treat negative values as errors,
-             * the return value of the DIGIC 6 stub is unverified */
-            if (FIO_SeekSkipFile(io->cr2, off + done, SEEK_SET) < 0)
-                return done;
-            io->cr2_pos = off + done;
+            /* returns the new position (550D, 750D: "plate seek -> 24");
+             * only treat negative values as errors */
+            if (FIO_SeekSkipFile(s->f, off + done, SEEK_SET) < 0)
+                break;
+            s->pos = off + done;
+            io->n_seek++;
         }
-        int r = FIO_ReadFile(io->cr2, io->bounce, m);
+        int r = FIO_ReadFile(s->f, io->bounce, m);
+        io->n_read++;
         if (r != m)
         {
-            io->cr2_pos = 0xFFFFFFFF;
-            return done;
+            s->pos = 0xFFFFFFFF;
+            break;
         }
         memcpy((uint8_t *) buf + done, io->bounce, m);
-        io->cr2_pos += m;
+        s->pos += m;
         done += m;
     }
+    io->t_read += get_ms_clock() - t0;
     return done;
 }
 
 static int cr2_read_plate(void * ctx, void * buf, int n)
 {
-    return FIO_ReadFile(((struct cr2_io *) ctx)->plate, buf, n);
+    struct cr2_io * io = ctx;
+    int t0 = get_ms_clock();
+    int r = FIO_ReadFile(io->plate, buf, n);
+    io->t_plate += get_ms_clock() - t0;
+    io->n_plate++;
+    return r;
 }
 
 static int cr2_write(void * ctx, const void * buf, int n)
 {
-    return FIO_WriteFile(((struct cr2_io *) ctx)->out, buf, n);
+    /* buf is cacheable: ML's FIO_WriteFile cleans the cache before the DMA */
+    struct cr2_io * io = ctx;
+    int t0 = get_ms_clock();
+    int r = FIO_WriteFile(io->out, buf, n);
+    io->t_write += get_ms_clock() - t0;
+    io->n_write++;
+    return r;
 }
 
 static void cr2_yield(void * ctx)
 {
-    /* low priority task, but DryOS does not time-slice equal priorities;
-     * sleep after ~100 ms of work (msleep(10) is 11 ms on 750D) */
+    /* DryOS does not time-slice equal priorities: let ML's menu/shoot tasks
+     * (same priority) and everything below run every ~200 ms */
+    struct cr2_io * io = ctx;
     static int last = 0;
     int now = get_ms_clock();
-    if (now - last >= 100)
+    if (now - last >= 200)
     {
         msleep(10);
         last = get_ms_clock();
+        io->t_yield += last - now;
     }
 }
+
+static int cr2_now(void) { return get_ms_clock(); }
 
 static struct grn_cr2 cr2_hdr;              /* ~6 KB, keep it off the task stack */
 static struct grn_cr2_job * volatile cr2_job = 0;
@@ -547,9 +573,50 @@ static int cr2_wait_file(int file_number, char * fn, int size, uint32_t * fsize,
     return 0;
 }
 
+/* buffer sizes, largest first: fewer FIO calls; fall back when memory is short */
+static const struct { int chunk, out_rows, plate_rows; } cr2_tiers[] = {
+    { 128 * 1024, 32, 32 },     /* ~1.1 MB on 750D */
+    {  64 * 1024, 16, 16 },     /* ~0.6 MB */
+};
+
+static void cr2_free_bufs(struct grn_cr2_job * j)
+{
+    for (int k = 0; k < GRN_CR2_MAX_SLICES; k++)
+        if (j->in[k]) { free(j->in[k]); j->in[k] = 0; }
+    if (j->row)         { free(j->row);         j->row = 0; }
+    if (j->packed_row)  { free(j->packed_row);  j->packed_row = 0; }
+    if (j->out)         { free(j->out);         j->out = 0; }
+    if (j->plate_row)   { free(j->plate_row);   j->plate_row = 0; }
+    if (j->plate_strip) { free(j->plate_strip); j->plate_strip = 0; }
+}
+
+/* temporary memory (shoot_malloc when available, like the 550D frame buffer) */
+static int cr2_alloc_bufs(struct grn_cr2_job * j, int tier)
+{
+    const struct grn_cr2 * c = j->c;
+    const int pitch = c->width * 14 / 8;
+    for (int k = 0; k < c->nslices; k++)
+        if (!(j->in[k] = tmp_malloc(cr2_tiers[tier].chunk))) return 0;
+    j->in_size    = cr2_tiers[tier].chunk;
+    j->row        = malloc(c->width * 2);
+    j->packed_row = malloc(pitch);
+    j->out        = fio_malloc(pitch * cr2_tiers[tier].out_rows);
+    j->strip_rows = cr2_tiers[tier].out_rows;
+    if (!j->row || !j->packed_row || !j->out) return 0;
+    if (j->strength > 0)
+    {
+        j->plate_row   = malloc(j->plate_w * 2);
+        j->plate_strip = fio_malloc(j->plate_w * 2 * cr2_tiers[tier].plate_rows);
+        j->plate_rows  = cr2_tiers[tier].plate_rows;
+        if (!j->plate_row || !j->plate_strip) return 0;
+    }
+    return 1;
+}
+
 static void cr2_process(int file_number, int max_wait)
 {
-    struct cr2_io io = { 0 };
+    struct cr2_io io;
+    memset(&io, 0, sizeof(io));
     struct grn_cr2_job * j = 0;
     uint8_t * scratch = 0;
     uint8_t * hdr = 0;
@@ -570,20 +637,25 @@ static void cr2_process(int file_number, int max_wait)
     LOG("%s: %d bytes", cr2_fn, fsize);
 
     int t0 = get_ms_clock();
-    io.bounce = dma_malloc(CR2_CHUNK);
-    scratch   = malloc(2048);
-    j         = malloc(sizeof(*j));
-    io.cr2    = FIO_OpenFile(cr2_fn, O_RDONLY | O_SYNC);
-    if (!io.bounce || !scratch || !j || !io.cr2)
+    for (int t = 0; t < COUNT(cr2_tiers) && !io.bounce; t++)
     {
-        set_result(io.cr2 ? "not enough memory" : "cannot open CR2");
+        io.bounce = fio_malloc(cr2_tiers[t].chunk);
+        io.bounce_size = cr2_tiers[t].chunk;
+    }
+    scratch = malloc(2048);
+    j       = malloc(sizeof(*j));
+    for (int k = 0; k < GRN_CR2_MAX_SLICES; k++)
+        io.src[k].io = &io;
+    io.src[0].f = FIO_OpenFile(cr2_fn, O_RDONLY | O_SYNC);
+    if (!io.bounce || !scratch || !j || !io.src[0].f)
+    {
+        set_result(io.src[0].f ? "not enough memory" : "cannot open CR2");
         goto done;
     }
     memset(j, 0, sizeof(*j));
-    io.cr2_pos = 0;
 
     struct grn_cr2 * c = &cr2_hdr;
-    int r = grn_cr2_parse(c, &io, cr2_read, scratch, 2048);
+    int r = grn_cr2_parse(c, &io.src[0], cr2_read, scratch, 2048);
     if (r)
     {
         set_result(cr2_strerror(r));
@@ -604,6 +676,13 @@ static void cr2_process(int file_number, int max_wait)
     cam_active_w = c->x2 - c->x1;
     cam_active_h = c->y2 - c->y1;
 
+    /* one more handle per extra slice; if the FS refuses, share handle 0 (seeks) */
+    for (int k = 1; k < c->nslices; k++)
+    {
+        io.src[k].f = FIO_OpenFile(cr2_fn, O_RDONLY | O_SYNC);
+        if (!io.src[k].f) LOG("2nd CR2 handle refused, slice %d shares handle 0", k);
+    }
+
     j->c = c;
     j->strength = grain_strength;
     j->mode = grain_mode;
@@ -623,39 +702,33 @@ static void cr2_process(int file_number, int max_wait)
         }
         j->plate_w = plate_w; j->plate_h = plate_h;
         j->plate_black = plate_black; j->plate_white = plate_white;
-        j->plate_row   = malloc(plate_w * 2);
-        j->plate_strip = dma_malloc(plate_w * 2 * CR2_STRIP_ROWS);
-        io.plate       = FIO_OpenFile(PLATE_PATH, O_RDONLY | O_SYNC);
-        if (!j->plate_row || !j->plate_strip || !io.plate)
+        io.plate = FIO_OpenFile(PLATE_PATH, O_RDONLY | O_SYNC);
+        if (!io.plate || FIO_SeekSkipFile(io.plate, GRN_HEADER_SIZE, SEEK_SET) < 0)
         {
             set_result("plate open failed");
             goto done;
         }
-        int64_t sp = FIO_SeekSkipFile(io.plate, GRN_HEADER_SIZE, SEEK_SET);
-        LOG("plate seek -> %d", (int) sp);
-        if (sp < 0)
-        {
-            set_result("plate seek failed");
-            goto done;
-        }
     }
 
-    const int pitch = c->width * 14 / 8;
-    for (int k = 0; k < c->nslices; k++)
-        if (!(j->in[k] = malloc(CR2_CHUNK))) goto nomem;
-    j->in_size    = CR2_CHUNK;
-    j->row        = malloc(c->width * 2);
-    j->packed_row = malloc(pitch);
-    j->out        = dma_malloc(pitch * CR2_STRIP_ROWS);
-    j->strip_rows = CR2_STRIP_ROWS;
-    hdr           = dma_malloc(GRN_DNG_HEADER_MAX);
-    if (!j->row || !j->packed_row || !j->out || !hdr) goto nomem;
+    int tier = -1;
+    for (int t = 0; t < COUNT(cr2_tiers) && tier < 0; t++)
+    {
+        if (cr2_tiers[t].chunk > io.bounce_size) continue;
+        if (cr2_alloc_bufs(j, t)) tier = t;
+        else cr2_free_bufs(j);
+    }
+    hdr = fio_malloc(GRN_DNG_HEADER_MAX);
+    if (tier < 0 || !hdr) goto nomem;
+    LOG("buffers: chunk %d KB, %d DNG rows, %d plate rows per call", j->in_size / 1024, j->strip_rows, j->plate_rows);
 
     j->ctx = &io;
+    for (int k = 0; k < c->nslices; k++)
+        j->slice_ctx[k] = io.src[k].f ? &io.src[k] : &io.src[0];
     j->read_cr2 = cr2_read;
     j->read_plate = cr2_read_plate;
     j->write_out = cr2_write;
     j->yield = cr2_yield;
+    j->now_ms = cr2_now;
 
     snprintf(dng_fn, sizeof(dng_fn), "%s/GRN_%04d.DNG", get_dcim_dir(), file_number);
     io.out = FIO_CreateFile(dng_fn);
@@ -679,7 +752,13 @@ static void cr2_process(int file_number, int max_wait)
         goto done;
     }
 
-    snprintf(msg, sizeof(msg), "GRN_%04d: %d ms", file_number, get_ms_clock() - t0);
+    int total = get_ms_clock() - t0;
+    int io_ms = io.t_read + io.t_plate + io.t_write;
+    LOG("total %d ms: pass1 %d, pass2 %d", total, j->t_index, j->t_total - j->t_index);
+    LOG("cr2 read %d ms (%d calls, %d seeks), plate read %d ms (%d), dng write %d ms (%d), yield %d ms",
+        io.t_read, io.n_read, io.n_seek, io.t_plate, io.n_plate, io.t_write, io.n_write, io.t_yield);
+    LOG("cpu (decode+blend+pack) %d ms", j->t_total - io_ms - io.t_yield);
+    snprintf(msg, sizeof(msg), "GRN_%04d: %d ms (io %d)", file_number, total, io_ms);
     set_result(msg);
     ok = 1;
     goto done;
@@ -692,15 +771,11 @@ done:
     cr2_job = 0;
     if (io.out)   FIO_CloseFile(io.out);
     if (io.plate) FIO_CloseFile(io.plate);
-    if (io.cr2)   FIO_CloseFile(io.cr2);
+    for (int k = 0; k < GRN_CR2_MAX_SLICES; k++)
+        if (io.src[k].f) FIO_CloseFile(io.src[k].f);
     if (j)
     {
-        for (int k = 0; k < GRN_CR2_MAX_SLICES; k++) if (j->in[k]) free(j->in[k]);
-        if (j->row)         free(j->row);
-        if (j->packed_row)  free(j->packed_row);
-        if (j->out)         free(j->out);
-        if (j->plate_row)   free(j->plate_row);
-        if (j->plate_strip) free(j->plate_strip);
+        cr2_free_bufs(j);
         free(j);
     }
     if (hdr)       free(hdr);
@@ -962,10 +1037,11 @@ static unsigned int grain_init()
 {
     plate_load_header();
     menu_add("Shoot", grain_menu, COUNT(grain_menu));
-    /* CR2 source; idles when disabled. Background priority: decoding takes
-     * seconds of CPU and must never starve Canon's LiveView tasks */
+    /* CR2 source; idles when disabled. Same priority as the raw buffer worker:
+     * below Canon's LiveView tasks, above ML's background ones (0x1e: overlay
+     * redraw etc., which kept the first version waiting for CPU) */
     cr2_watch_running = 1;
-    task_create("grain_cr2", 0x1e, 0x4000, cr2_watch_task, 0);
+    task_create("grain_cr2", 0x1a, 0x4000, cr2_watch_task, 0);
     return 0;
 }
 

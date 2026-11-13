@@ -523,11 +523,13 @@ static inline int grn_lj_next(struct grn_ljdec * d, int * marker)
 }
 
 /*
- * decode the next n samples of the stream (out may be NULL to skip).
+ * advance n samples. full: compute every value (out may be NULL);
+ * !full: only follow the bit stream and the first-column predictors, which is
+ * enough to resume full decoding at the start of a JPEG row (pass 1).
  * State lives in locals: ML builds with -fno-strict-aliasing, so every store
  * to out[] would otherwise force reloading the whole state from *d.
  */
-static inline int grn_lj_decode(struct grn_ljdec * d, uint16_t * out, int n)
+static inline int grn_lj_run(struct grn_ljdec * d, uint16_t * out, int n, const int full)
 {
     const struct grn_cr2 * c = d->c;
     const int clrs = c->clrs, jw = c->jw;
@@ -575,6 +577,23 @@ static inline int grn_lj_decode(struct grn_ljdec * d, uint16_t * out, int n)
         }
         bitbuf <<= l; bitcnt -= l;
 
+        if (!full && col)
+        {
+            /* skip the difference bits; left[] goes stale until the next row start */
+            if (len > 16) { err = GRN_CR2_ERR_DATA; break; }
+            if (len && len < 16)
+            {
+                GRN_FILL();
+                bitbuf <<= len; bitcnt -= len;
+            }
+            if (++comp == clrs)
+            {
+                comp = 0;
+                if (++col == jw) col = 0;
+            }
+            continue;
+        }
+
         /* difference bits */
         int diff = 0;
         if (len >= 16)
@@ -610,6 +629,9 @@ static inline int grn_lj_decode(struct grn_ljdec * d, uint16_t * out, int n)
     return d->error ? d->error : err;
 }
 
+static inline int grn_lj_decode(struct grn_ljdec * d, uint16_t * out, int n) { return grn_lj_run(d, out, n, 1); }
+static inline int grn_lj_skip(struct grn_ljdec * d, int n)                   { return grn_lj_run(d, 0, n, 0); }
+
 /* ------------------------------------------------------------------ */
 /* CR2 -> DNG                                                          */
 /* ------------------------------------------------------------------ */
@@ -626,18 +648,22 @@ struct grn_cr2_job
     uint8_t * in[GRN_CR2_MAX_SLICES];     /* cached input chunks, one per slice */
     int in_size;
     uint16_t * row;                       /* width */
-    uint8_t * packed_row;                 /* pitch, cached */
     uint16_t * plate_row;                 /* plate_w, cached */
-    uint8_t * out;                        /* strip_rows * pitch, DMA */
-    uint8_t * plate_strip;                /* strip_rows * plate_w * 2, DMA */
-    int strip_rows;
+    uint8_t * packed_row;                 /* optional cached pitch buffer, then memcpy to out (DMA);
+                                           * NULL: pack straight into out (cached out only) */
+    uint8_t * out;                        /* strip_rows * pitch */
+    uint8_t * plate_strip;                /* plate_rows * plate_w * 2, DMA */
+    int strip_rows, plate_rows;
 
     /* I/O */
     void * ctx;
+    void * slice_ctx[GRN_CR2_MAX_SLICES]; /* optional ctx per slice decoder for read_cr2 (own file handle) */
     grn_read_fn read_cr2;
     int  (*read_plate)(void * ctx, void * buf, int bytes);
     int  (*write_out) (void * ctx, const void * buf, int bytes);
     void (*yield)     (void * ctx);
+    int  (*now_ms)    (void);             /* optional, for t_index / t_total */
+    int t_index, t_total;
 };
 
 /* local string helpers: strncmp/strncpy are not exported by every ML core */
@@ -707,57 +733,72 @@ static inline void grn_cr2_dng_info(const struct grn_cr2 * c, struct grn_dng_inf
     }
 }
 
+/* plain division: keeps GCC from fusing a / b * b into __aeabi_uidivmod,
+ * which older ML cores may not export (__aeabi_uidiv they all do) */
+static uint32_t __attribute__((noinline)) grn_udiv(uint32_t a, uint32_t b) { return a / b; }
+
 /*
- * Pass 1: decode up to the start of the last slice, remember the decoder
- * state at each slice start; if the makernote had no black level, measure it
- * on the masked columns left of the active area (always in slice 0).
+ * Pass 1: find the decoder state at each slice start. Only the bit stream and
+ * the first-column predictors are followed (grn_lj_skip), plus a full decode
+ * of the JPEG row part before a slice start (left predictors). If the
+ * makernote had no black level, slice 0 is decoded fully to measure it on the
+ * masked columns left of the active area.
  */
 static inline int grn_cr2_index(struct grn_cr2_job * j, struct grn_ljstate * st)
 {
     struct grn_cr2 * c = j->c;
     const int H = c->height;
     struct grn_ljdec d;
-    grn_lj_init(&d, c, j->ctx, j->read_cr2, j->in[0], j->in_size);
+    grn_lj_init(&d, c, j->slice_ctx[0] ? j->slice_ctx[0] : j->ctx, j->read_cr2, j->in[0], j->in_size);
     grn_lj_save(&d, &st[0]);
+
+    const uint32_t rowlen = c->jw * c->clrs;                            /* samples per JPEG row */
+    const uint32_t last = (uint32_t) c->slice_x[c->nslices - 1] * H;    /* start of the last slice */
+    uint32_t pos = 0;
+    int r;
 
     /* masked columns; stay well left of the JPEG crop, the first columns right
      * of x1/2 can already hold image data (750D: dcraw starts the image at 72, x1 = 84) */
     const int w0 = c->slice_wd[0];
     const int ob_x0 = c->x1 / 8, ob_x1 = c->x1 / 2;
-    const int need_black = !c->black && ob_x1 - ob_x0 >= 8 && ob_x1 <= w0;
-    uint32_t ob_sum = 0, ob_n = 0;
-
-    /* rows of slice 0 needed for the black level (+ all slices but the last for the indexes) */
-    for (int k = 1; k <= c->nslices; k++)
+    if (!c->black && ob_x1 - ob_x0 >= 8 && ob_x1 <= w0)
     {
-        if (k == c->nslices && !(need_black && c->nslices == 1)) break;
-        int y_end = H;
-        for (int y = 0; y < y_end; y++)
+        uint32_t ob_sum = 0, ob_n = 0;
+        for (int y = 0; y < H; y++)
         {
-            int w = c->slice_wd[k-1];
-            if (k == 1 && need_black && y >= c->y1 && y < c->y2)
+            if ((r = grn_lj_decode(&d, j->row, w0))) return r;
+            if (y >= c->y1 && y < c->y2)
             {
-                int r = grn_lj_decode(&d, j->row, w);
-                if (r) return r;
                 for (int x = ob_x0; x < ob_x1; x++) ob_sum += j->row[x];
                 ob_n += ob_x1 - ob_x0;
             }
-            else
-            {
-                int r = grn_lj_decode(&d, 0, w);
-                if (r) return r;
-            }
-            if ((y & 63) == 63)
-            {
-                j->progress = 30 * ((k - 1) * H + y) / (c->nslices * H);
-                if (j->yield) j->yield(j->ctx);
-            }
+            if ((y & 63) == 63 && j->yield) j->yield(j->ctx);
         }
-        if (k < c->nslices) grn_lj_save(&d, &st[k]);
+        pos = (uint32_t) w0 * H;
+        if (ob_n) c->black = (ob_sum + ob_n / 2) / ob_n;
     }
-
-    if (need_black && ob_n) c->black = (ob_sum + ob_n / 2) / ob_n;
     if (!c->black) return GRN_CR2_ERR_FORMAT;
+
+    for (int k = 1; k < c->nslices; k++)
+    {
+        uint32_t b = (uint32_t) c->slice_x[k] * H;      /* linear sample index of the slice start */
+        uint32_t row0 = grn_udiv(b, rowlen) * rowlen;   /* start of its JPEG row */
+        while (pos < row0)
+        {
+            uint32_t n = row0 - pos;
+            if (n > 64 * rowlen) n = 64 * rowlen;
+            if ((r = grn_lj_skip(&d, n))) return r;
+            pos += n;
+            j->progress = 30 * (pos / 1024) / (last / 1024 + 1);
+            if (j->yield) j->yield(j->ctx);
+        }
+        if (b > pos)
+        {
+            if ((r = grn_lj_decode(&d, 0, b - pos))) return r;
+            pos = b;
+        }
+        grn_lj_save(&d, &st[k]);
+    }
     return 0;
 }
 
@@ -775,9 +816,11 @@ static inline int grn_cr2_to_dng(struct grn_cr2_job * j, uint8_t * hdr, int hdr_
         return GRN_CR2_ERR_GEOMETRY;
 
     j->progress = 0;
+    const int t0 = j->now_ms ? j->now_ms() : 0;
     struct grn_ljstate st[GRN_CR2_MAX_SLICES];
     int r = grn_cr2_index(j, st);
     if (r) return r;
+    if (j->now_ms) j->t_index = j->now_ms() - t0;
 
     /* header */
     struct grn_dng_info di;
@@ -792,7 +835,7 @@ static inline int grn_cr2_to_dng(struct grn_cr2_job * j, uint8_t * hdr, int hdr_
     struct grn_ljdec d[GRN_CR2_MAX_SLICES];
     for (int k = 0; k < c->nslices; k++)
     {
-        grn_lj_init(&d[k], c, j->ctx, j->read_cr2, j->in[k], j->in_size);
+        grn_lj_init(&d[k], c, j->slice_ctx[k] ? j->slice_ctx[k] : j->ctx, j->read_cr2, j->in[k], j->in_size);
         grn_lj_restore(&d[k], &st[k]);
     }
 
@@ -814,7 +857,7 @@ static inline int grn_cr2_to_dng(struct grn_cr2_job * j, uint8_t * hdr, int hdr_
             {
                 plate_start += plate_rows;
                 int m = j->plate_h - plate_start;
-                if (m > j->strip_rows) m = j->strip_rows;
+                if (m > j->plate_rows) m = j->plate_rows;
                 if (j->read_plate(j->ctx, j->plate_strip, m * plate_row_bytes) != m * plate_row_bytes)
                     return GRN_CR2_ERR_PLATE;
                 plate_rows = m;
@@ -823,9 +866,11 @@ static inline int grn_cr2_to_dng(struct grn_cr2_job * j, uint8_t * hdr, int hdr_
             grn_blend_span(&j->bp, j->row, c->x1, j->plate_row, j->plate_w);
         }
 
-        grn_pack_row(j->row, j->packed_row, W);
-        grn_row_to_dng(j->packed_row, pitch);
-        memcpy(j->out + n_out * pitch, j->packed_row, pitch);
+        uint8_t * dst = j->out + n_out * pitch;
+        uint8_t * pk = j->packed_row ? j->packed_row : dst;
+        grn_pack_row(j->row, pk, W);
+        grn_row_to_dng(pk, pitch);
+        if (pk != dst) memcpy(dst, pk, pitch);
 
         if (++n_out == j->strip_rows || y == H - 1)
         {
@@ -836,6 +881,7 @@ static inline int grn_cr2_to_dng(struct grn_cr2_job * j, uint8_t * hdr, int hdr_
             if (j->yield) j->yield(j->ctx);
         }
     }
+    if (j->now_ms) j->t_total = j->now_ms() - t0;
     return 0;
 }
 

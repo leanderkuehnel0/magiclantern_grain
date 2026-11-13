@@ -26,15 +26,20 @@ struct io
     FILE * out;
     const uint16_t * plate;
     size_t plate_pos, plate_bytes;
-    int reads, yields;
+    long pos;
+    int reads, seeks, yields;
 };
 
+/* one handle per slice decoder (like the camera); count seeks = non-sequential reads */
 static int rd_cr2(void * ctx, uint32_t off, void * buf, int n)
 {
     struct io * io = ctx;
     io->reads++;
+    if (off != io->pos) io->seeks++;
     if (fseek(io->cr2, off, SEEK_SET)) return -1;
-    return fread(buf, 1, n, io->cr2);
+    int r = fread(buf, 1, n, io->cr2);
+    io->pos = off + r;
+    return r;
 }
 
 static int rd_plate(void * ctx, void * buf, int n)
@@ -116,17 +121,24 @@ static int run(struct grn_cr2 * c, const char * cr2_fn, const char * out_fn,
     for (int k = 0; k < c->nslices; k++) j.in[k] = malloc(in_size);
     j.in_size = in_size;
     j.row = malloc(c->width * 2);
-    j.packed_row = malloc(c->width * 14 / 8);
     j.plate_row = malloc(pw * 2 + 2);
     j.out = malloc(strip * c->width * 14 / 8);
-    j.plate_strip = malloc(strip * pw * 2 + 2);
+    j.plate_strip = malloc(2 * strip * pw * 2 + 2);
     j.strip_rows = strip;
+    j.plate_rows = 2 * strip;
+    if (strength) j.packed_row = malloc(c->width * 14 / 8);   /* camera path: pack, then copy to the DMA strip */
     j.ctx = &io; j.read_cr2 = rd_cr2; j.read_plate = rd_plate; j.write_out = wr_out; j.yield = yield;
+    struct io sl[GRN_CR2_MAX_SLICES] = { { 0 } };
+    for (int k = 0; k < c->nslices; k++) { sl[k].cr2 = fopen(cr2_fn, "rb"); j.slice_ctx[k] = &sl[k]; }
 
     static uint8_t hdr[GRN_DNG_HEADER_MAX];
     r = grn_cr2_to_dng(&j, hdr, sizeof(hdr));
-    printf("%s: result %d, %d chunk reads, %d yields, progress %d%%\n", out_fn, r, io.reads, io.yields, j.progress);
+    int reads = 0, seeks = 0;
+    for (int k = 0; k < c->nslices; k++) { reads += sl[k].reads; seeks += sl[k].seeks; fclose(sl[k].cr2); }
+    printf("%s: result %d, %d chunk reads, %d seeks, %d yields, progress %d%%\n", out_fn, r, reads, seeks, io.yields, j.progress);
     CHECK(r || j.progress == 100, "progress ended at %d%%", j.progress);
+    /* one seek per slice decoder to its start (slice 0 re-reads from the scan start) */
+    CHECK(r || seeks <= c->nslices + 1, "%d seeks, expected sequential reads per slice", seeks);
     fclose(io.cr2); fclose(io.out);
     return r;
 }
